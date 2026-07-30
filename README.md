@@ -1,5 +1,7 @@
 # Smart Payment Recovery
 
+[![CI](https://github.com/LOGOSCPECTUS/spr/actions/workflows/ci.yml/badge.svg)](https://github.com/LOGOSCPECTUS/spr/actions/workflows/ci.yml)
+
 A backend micro-SaaS that automatically recovers failed subscription payments.
 It ingests Stripe `invoice.payment_failed` webhooks, generates a personalized
 dunning (recovery) email with **Claude**, sends it via **Resend**, and exposes
