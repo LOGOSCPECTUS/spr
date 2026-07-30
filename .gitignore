@@ -1,0 +1,8 @@
+node_modules/
+dist/
+# Ignore every .env variant (including stray sync copies like ".env копія.txt"),
+# but keep the committed template.
+.env*
+!.env.example
+*.log
+.DS_Store
