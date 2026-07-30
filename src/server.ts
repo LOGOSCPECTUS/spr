@@ -6,6 +6,7 @@ import express, {
   type NextFunction,
 } from 'express';
 
+import { extractSecret, secretsMatch } from './api/auth';
 import { analyticsRouter } from './api/routes/analytics';
 import { cronRouter } from './api/routes/cron';
 import { stripeWebhookRouter } from './api/webhooks/stripe';
@@ -44,10 +45,35 @@ app.use('/api/v1/analytics', analyticsRouter);
  * losses, generates a cold email (Claude with template fallback), and — unless
  * `send: false` is passed — delivers it via Resend.
  *
+ * Secured with a shared secret passed as `Authorization: Bearer <secret>` (or
+ * the `x-outreach-secret` header), compared against OUTREACH_SECRET (falling
+ * back to CRON_SECRET when OUTREACH_SECRET is unset).
+ *
  * Body: { companyName, contactEmail, mrrCents, currency?, contactName?, send? }
  */
 app.post('/api/v1/outreach/trigger', async (req: Request, res: Response) => {
   try {
+    const expected = process.env.OUTREACH_SECRET ?? process.env.CRON_SECRET;
+    if (!expected) {
+      console.error('[outreach] OUTREACH_SECRET/CRON_SECRET is not configured');
+      res.status(500).json({
+        error: 'ConfigurationError',
+        message: 'Outreach secret not configured',
+        statusCode: 500,
+      } satisfies ApiError);
+      return;
+    }
+
+    const provided = extractSecret(req, 'x-outreach-secret');
+    if (!provided || !secretsMatch(provided, expected)) {
+      res.status(401).json({
+        error: 'Unauthorized',
+        message: 'Missing or invalid outreach secret',
+        statusCode: 401,
+      } satisfies ApiError);
+      return;
+    }
+
     const body = (req.body ?? {}) as Partial<OutreachInput> & {
       send?: boolean;
     };

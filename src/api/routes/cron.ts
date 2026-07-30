@@ -1,22 +1,10 @@
 import { Router, type Request, type Response } from 'express';
 
+import { extractSecret, secretsMatch } from '../auth';
 import { processPendingRecoveryCampaigns } from '../../services/recoveryWorker';
 import type { ApiError } from '../../types';
 
 export const cronRouter: Router = Router();
-
-/**
- * Constant-time-ish comparison to avoid leaking secret length via early return.
- * Not a substitute for a real MAC, but adequate for a shared cron secret.
- */
-function secretsMatch(provided: string, expected: string): boolean {
-  if (provided.length !== expected.length) return false;
-  let mismatch = 0;
-  for (let i = 0; i < provided.length; i += 1) {
-    mismatch |= provided.charCodeAt(i) ^ expected.charCodeAt(i);
-  }
-  return mismatch === 0;
-}
 
 /**
  * POST /api/v1/cron/recovery-worker
@@ -37,9 +25,7 @@ cronRouter.post('/recovery-worker', async (req: Request, res: Response) => {
     return;
   }
 
-  const header = req.headers['x-cron-secret'];
-  const bearer = req.headers.authorization?.replace(/^Bearer\s+/i, '');
-  const provided = typeof header === 'string' ? header : bearer;
+  const provided = extractSecret(req, 'x-cron-secret');
 
   if (!provided || !secretsMatch(provided, expected)) {
     res.status(401).json({
