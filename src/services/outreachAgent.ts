@@ -10,6 +10,9 @@ import { Resend } from 'resend';
  * deterministic template when no ANTHROPIC_API_KEY is set), and sends it via
  * Resend.
  *
+ * Actual delivery is rate-limited and queued by `outreachDispatcher.ts`; this
+ * module owns the financial model, copy generation, and the raw send.
+ *
  * All monetary amounts are handled in the smallest currency unit (cents),
  * consistent with the rest of the service and Stripe.
  */
@@ -39,6 +42,14 @@ export const PLATFORM_FEE_RATE = 0.2;
 
 /** Claude model used for cold-email generation. Matches aiGenerator.ts. */
 const MODEL = 'claude-sonnet-5';
+
+/**
+ * Public base URL used to build unsubscribe links. Must point at this service's
+ * externally-reachable origin in production (e.g. the Render URL).
+ */
+const PUBLIC_BASE_URL = (
+  process.env.PUBLIC_BASE_URL ?? 'http://localhost:3000'
+).replace(/\/+$/, '');
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -86,17 +97,8 @@ export interface ColdEmail {
   html: string;
 }
 
-/** Aggregate result of an outreach run. */
-export interface OutreachResult {
-  companyName: string;
-  contactEmail: string;
-  estimate: LossEstimate;
-  email: ColdEmail;
-  /** Whether the email body came from Claude (`ai`) or the template fallback. */
-  source: 'ai' | 'template';
-  /** Resend message id when an email was sent; null when sending was skipped. */
-  emailId: string | null;
-}
+/** Source of a generated email body. */
+export type EmailSource = 'ai' | 'template';
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -124,6 +126,34 @@ function escapeHtml(value: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+/**
+ * Build the unsubscribe URL for a given token. The token maps back to the
+ * recipient via `outreach_messages.unsubscribe_token`.
+ */
+export function buildUnsubscribeUrl(token: string): string {
+  return `${PUBLIC_BASE_URL}/api/v1/outreach/unsubscribe?token=${encodeURIComponent(
+    token,
+  )}`;
+}
+
+/**
+ * CAN-SPAM / GDPR compliant footer with a working unsubscribe link. Always
+ * appended to every outbound email regardless of generation path, so the opt-out
+ * is present even when the LLM ignores instructions.
+ */
+function unsubscribeFooterHtml(email: string, unsubscribeUrl: string): string {
+  return [
+    '<hr style="border:none;border-top:1px solid #eee;margin:16px 0;"/>',
+    '<p style="font-size:12px;color:#888;line-height:1.4;">',
+    `This message was sent to ${escapeHtml(email)} as business-to-business `,
+    'outreach from Smart Payment Recovery. If this isn’t relevant, ',
+    `you can <a href="${escapeHtml(
+      unsubscribeUrl,
+    )}" style="color:#888;">unsubscribe here</a> and we won’t contact you again.`,
+    '</p>',
+  ].join('');
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +241,7 @@ function buildSystemPrompt(): string {
     '- One clear call to action (a brief intro call). No aggressive pressure.',
     '- "html" must be a self-contained HTML fragment (no <html>/<head>/<body>',
     '  wrapper), inline styles only.',
+    '- Do NOT add an unsubscribe footer; the system appends one automatically.',
     '- Keep it under ~160 words.',
   ].join('\n');
 }
@@ -240,11 +271,12 @@ function buildUserPrompt(input: OutreachInput, estimate: LossEstimate): string {
 
 /**
  * Deterministic template cold email. Serves as the fallback whenever the LLM
- * path is unavailable or fails.
+ * path is unavailable or fails. Always includes a working unsubscribe link.
  */
 export function buildFallbackColdEmail(
   input: OutreachInput,
   estimate: LossEstimate,
+  unsubscribeUrl: string,
 ): ColdEmail {
   const currency = input.currency ?? 'usd';
   const company = escapeHtml(input.companyName);
@@ -268,9 +300,7 @@ export function buildFallbackColdEmail(
     `<p>Smart Payment Recovery automatically wins back around half of that — an estimated <strong>${recoverableAnnual} in recovered revenue per year</strong>, at a projected <strong>${estimate.roiPercent}% ROI</strong>. You only pay on what we actually recover.</p>`,
     '<p>Worth a quick 15-minute call to see the numbers for your account?</p>',
     '<p>Best,<br/>The Smart Payment Recovery Team</p>',
-    `<hr/><p style="font-size:12px;color:#888;">Sent to ${escapeHtml(
-      input.contactEmail,
-    )}. Reply "unsubscribe" to opt out.</p>`,
+    unsubscribeFooterHtml(input.contactEmail, unsubscribeUrl),
     '</div>',
   ].join('\n');
 
@@ -280,14 +310,18 @@ export function buildFallbackColdEmail(
 /**
  * Generate a cold outreach email for a prospect using Claude, falling back to
  * a deterministic template if the LLM path is unavailable or fails for any
- * reason. The second element reports which path produced the email.
+ * reason. A compliant unsubscribe footer is appended to every result.
  */
 export async function generateColdEmail(
   input: OutreachInput,
   estimate: LossEstimate,
-): Promise<{ email: ColdEmail; source: 'ai' | 'template' }> {
+  unsubscribeUrl: string,
+): Promise<{ email: ColdEmail; source: EmailSource }> {
   if (!anthropic) {
-    return { email: buildFallbackColdEmail(input, estimate), source: 'template' };
+    return {
+      email: buildFallbackColdEmail(input, estimate, unsubscribeUrl),
+      source: 'template',
+    };
   }
 
   try {
@@ -317,8 +351,14 @@ export async function generateColdEmail(
       throw new Error('Claude returned an empty subject or body');
     }
 
+    // Always append our own unsubscribe footer so the opt-out is guaranteed.
+    const html = `${parsed.html}\n${unsubscribeFooterHtml(
+      input.contactEmail,
+      unsubscribeUrl,
+    )}`;
+
     return {
-      email: { subject: parsed.subject, html: parsed.html },
+      email: { subject: parsed.subject, html },
       source: 'ai',
     };
   } catch (err) {
@@ -327,8 +367,31 @@ export async function generateColdEmail(
     console.warn(
       `[outreach-agent] LLM generation failed, using fallback: ${message}`,
     );
-    return { email: buildFallbackColdEmail(input, estimate), source: 'template' };
+    return {
+      email: buildFallbackColdEmail(input, estimate, unsubscribeUrl),
+      source: 'template',
+    };
   }
+}
+
+/**
+ * Preview the estimate and generated email for a prospect WITHOUT persisting or
+ * sending anything. Used by the trigger endpoint's dry-run mode. The unsubscribe
+ * link uses a placeholder token since no queue row exists yet.
+ */
+export async function previewOutreach(input: OutreachInput): Promise<{
+  estimate: LossEstimate;
+  email: ColdEmail;
+  source: EmailSource;
+}> {
+  const estimate = estimateLoss(input.mrrCents);
+  const unsubscribeUrl = buildUnsubscribeUrl('preview');
+  const { email, source } = await generateColdEmail(
+    input,
+    estimate,
+    unsubscribeUrl,
+  );
+  return { estimate, email, source };
 }
 
 // ---------------------------------------------------------------------------
@@ -350,12 +413,14 @@ const OUTREACH_FROM_EMAIL =
 /**
  * Send a cold outreach email via Resend.
  *
+ * @param options.headers Extra SMTP headers (e.g. `List-Unsubscribe`).
  * @returns the Resend message id.
  * @throws if Resend is not configured or returns an error.
  */
 export async function sendOutreachEmail(
   to: string,
   email: ColdEmail,
+  options: { headers?: Record<string, string> } = {},
 ): Promise<string> {
   if (!resend) {
     throw new Error('Missing Resend configuration: set RESEND_API_KEY');
@@ -366,6 +431,7 @@ export async function sendOutreachEmail(
     to,
     subject: email.subject,
     html: email.html,
+    ...(options.headers ? { headers: options.headers } : {}),
   });
 
   if (error) {
@@ -377,40 +443,4 @@ export async function sendOutreachEmail(
   }
 
   return data.id;
-}
-
-// ---------------------------------------------------------------------------
-// Orchestration
-// ---------------------------------------------------------------------------
-
-/**
- * Run the full outreach flow: estimate losses → generate a cold email → send it.
- *
- * @param input Prospect details.
- * @param options.send When `false`, generate the email but skip delivery (dry
- *   run). Defaults to `true`.
- * @throws if the input is invalid or (when sending) delivery fails.
- */
-export async function runOutreach(
-  input: OutreachInput,
-  options: { send?: boolean } = {},
-): Promise<OutreachResult> {
-  const send = options.send ?? true;
-
-  const estimate = estimateLoss(input.mrrCents);
-  const { email, source } = await generateColdEmail(input, estimate);
-
-  let emailId: string | null = null;
-  if (send) {
-    emailId = await sendOutreachEmail(input.contactEmail, email);
-  }
-
-  return {
-    companyName: input.companyName,
-    contactEmail: input.contactEmail,
-    estimate,
-    email,
-    source,
-    emailId,
-  };
 }

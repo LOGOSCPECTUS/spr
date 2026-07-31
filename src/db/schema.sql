@@ -55,3 +55,51 @@ create index if not exists idx_recovery_campaigns_failed_payment_id
 create index if not exists idx_recovery_campaigns_pending
   on public.recovery_campaigns (sent_at)
   where sent_at is null;
+
+-- ---------------------------------------------------------------------------
+-- outreach_messages: the cold-outreach send QUEUE
+--
+-- Each row is one prospect email waiting to be (or already) delivered. The
+-- dispatcher drains rows with status 'queued', respecting an hourly rate cap,
+-- generates the email, sends it via Resend, and stamps sent_at.
+-- ---------------------------------------------------------------------------
+create table if not exists public.outreach_messages (
+  id                uuid        primary key default gen_random_uuid(),
+  company_name      text        not null,
+  contact_email     text        not null,
+  contact_name      text,
+  mrr_cents         bigint      not null check (mrr_cents >= 0), -- smallest currency unit (cents)
+  currency          text        not null default 'usd',
+  subject           text,       -- filled at send time
+  html              text,       -- filled at send time
+  status            text        not null default 'queued'
+                      check (status in ('queued', 'sent', 'failed', 'skipped', 'cancelled')),
+  unsubscribe_token text        not null unique,
+  resend_message_id text,
+  error             text,
+  attempts          integer     not null default 0 check (attempts >= 0),
+  created_at        timestamptz not null default now(),
+  sent_at           timestamptz
+);
+
+create index if not exists idx_outreach_messages_status on public.outreach_messages (status);
+create index if not exists idx_outreach_messages_sent_at on public.outreach_messages (sent_at);
+
+-- Queued messages = awaiting dispatch, drained oldest-first.
+create index if not exists idx_outreach_messages_queued
+  on public.outreach_messages (created_at)
+  where status = 'queued';
+
+-- ---------------------------------------------------------------------------
+-- unsubscribes: suppression list (GDPR / CAN-SPAM opt-out)
+--
+-- An email present here must never receive outreach. `email` is stored
+-- lowercased by the application layer for case-insensitive matching.
+-- ---------------------------------------------------------------------------
+create table if not exists public.unsubscribes (
+  id         uuid        primary key default gen_random_uuid(),
+  email      text        not null unique,
+  token      text,       -- the unsubscribe token used, when known (audit)
+  reason     text,
+  created_at timestamptz not null default now()
+);

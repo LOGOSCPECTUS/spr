@@ -80,6 +80,65 @@ export type RecoveryCampaignInsert = {
   sent_at?: string | null;
 };
 
+export type OutreachStatus =
+  | 'queued'
+  | 'sent'
+  | 'failed'
+  | 'skipped'
+  | 'cancelled';
+
+/** `outreach_messages` — one queued/sent cold-outreach email. */
+export type OutreachMessage = {
+  id: string;
+  company_name: string;
+  contact_email: string;
+  contact_name: string | null;
+  /** Monthly Recurring Revenue in the smallest currency unit (cents). */
+  mrr_cents: number;
+  currency: string;
+  subject: string | null;
+  html: string | null;
+  status: OutreachStatus;
+  unsubscribe_token: string;
+  resend_message_id: string | null;
+  error: string | null;
+  attempts: number;
+  created_at: string;
+  sent_at: string | null;
+};
+
+export type OutreachMessageInsert = {
+  company_name: string;
+  contact_email: string;
+  contact_name?: string | null;
+  /** Monthly Recurring Revenue in the smallest currency unit (cents). */
+  mrr_cents: number;
+  currency?: string;
+  subject?: string | null;
+  html?: string | null;
+  status?: OutreachStatus;
+  unsubscribe_token: string;
+  resend_message_id?: string | null;
+  error?: string | null;
+  attempts?: number;
+  sent_at?: string | null;
+};
+
+/** `unsubscribes` — suppression list for opt-out compliance. */
+export type Unsubscribe = {
+  id: string;
+  email: string;
+  token: string | null;
+  reason: string | null;
+  created_at: string;
+};
+
+export type UnsubscribeInsert = {
+  email: string;
+  token?: string | null;
+  reason?: string | null;
+};
+
 /**
  * Minimal typed schema surface for `createClient<Database>()`.
  * Extend as additional tables are added.
@@ -120,6 +179,18 @@ export type Database = {
             referencedColumns: ['id'];
           },
         ];
+      };
+      outreach_messages: {
+        Row: OutreachMessage;
+        Insert: OutreachMessageInsert;
+        Update: Partial<OutreachMessageInsert>;
+        Relationships: [];
+      };
+      unsubscribes: {
+        Row: Unsubscribe;
+        Insert: UnsubscribeInsert;
+        Update: Partial<UnsubscribeInsert>;
+        Relationships: [];
       };
     };
     Views: { [_ in never]: never };

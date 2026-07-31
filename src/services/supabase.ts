@@ -6,6 +6,8 @@ import type {
   FailedPayment,
   FailedPaymentInsert,
   FailedPaymentStatus,
+  OutreachMessage,
+  OutreachMessageInsert,
   RecoveryCampaign,
   RecoveryCampaignInsert,
 } from '../types/database';
@@ -213,6 +215,156 @@ export async function updateFailedPaymentStatus(
 
   if (error) {
     throw new Error(`Failed to update payment status: ${error.message}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Outreach queue + suppression list
+// ---------------------------------------------------------------------------
+
+/**
+ * Insert a new outreach message into the send queue and return the created row.
+ *
+ * @throws if Supabase returns an error.
+ */
+export async function enqueueOutreachMessage(
+  message: OutreachMessageInsert,
+): Promise<OutreachMessage> {
+  const { data, error } = await supabase
+    .from('outreach_messages')
+    .insert(message)
+    .select()
+    .single();
+
+  if (error) {
+    throw new Error(`Failed to enqueue outreach message: ${error.message}`);
+  }
+
+  return data;
+}
+
+/**
+ * Fetch queued outreach messages, oldest first, up to `limit`.
+ *
+ * @throws if Supabase returns an error.
+ */
+export async function fetchQueuedOutreachMessages(
+  limit: number,
+): Promise<OutreachMessage[]> {
+  const { data, error } = await supabase
+    .from('outreach_messages')
+    .select()
+    .eq('status', 'queued')
+    .order('created_at', { ascending: true })
+    .limit(limit);
+
+  if (error) {
+    throw new Error(`Failed to fetch queued outreach messages: ${error.message}`);
+  }
+
+  return data ?? [];
+}
+
+/**
+ * Count outreach messages actually sent at/after `sinceIso`. Used by the
+ * rate limiter to enforce the hourly send cap.
+ *
+ * @throws if Supabase returns an error.
+ */
+export async function countOutreachSentSince(sinceIso: string): Promise<number> {
+  const { count, error } = await supabase
+    .from('outreach_messages')
+    .select('id', { count: 'exact', head: true })
+    .eq('status', 'sent')
+    .gte('sent_at', sinceIso);
+
+  if (error) {
+    throw new Error(`Failed to count sent outreach messages: ${error.message}`);
+  }
+
+  return count ?? 0;
+}
+
+/**
+ * Apply a partial update to an outreach message (status transitions, send
+ * stamping, error recording).
+ *
+ * @throws if Supabase returns an error.
+ */
+export async function updateOutreachMessage(
+  id: string,
+  fields: Partial<OutreachMessageInsert>,
+): Promise<void> {
+  const { error } = await supabase
+    .from('outreach_messages')
+    .update(fields)
+    .eq('id', id);
+
+  if (error) {
+    throw new Error(`Failed to update outreach message: ${error.message}`);
+  }
+}
+
+/**
+ * Look up a queued/sent outreach message by its unsubscribe token.
+ * Returns `null` when no matching row exists.
+ *
+ * @throws if Supabase returns an unexpected error.
+ */
+export async function getOutreachMessageByToken(
+  token: string,
+): Promise<OutreachMessage | null> {
+  const { data, error } = await supabase
+    .from('outreach_messages')
+    .select()
+    .eq('unsubscribe_token', token)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Failed to look up outreach message: ${error.message}`);
+  }
+
+  return data;
+}
+
+/**
+ * Whether an email address is on the suppression list. Matching is
+ * case-insensitive (the address is stored lowercased).
+ *
+ * @throws if Supabase returns an unexpected error.
+ */
+export async function isEmailUnsubscribed(email: string): Promise<boolean> {
+  const { data, error } = await supabase
+    .from('unsubscribes')
+    .select('id')
+    .eq('email', email.toLowerCase())
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(`Failed to check suppression list: ${error.message}`);
+  }
+
+  return data !== null;
+}
+
+/**
+ * Add an email to the suppression list. Idempotent — a repeat opt-out for an
+ * already-suppressed address is a no-op (no error).
+ *
+ * @throws if Supabase returns an error other than a duplicate.
+ */
+export async function addUnsubscribe(
+  email: string,
+  token: string | null = null,
+  reason: string | null = null,
+): Promise<void> {
+  const { error } = await supabase.from('unsubscribes').upsert(
+    { email: email.toLowerCase(), token, reason },
+    { onConflict: 'email', ignoreDuplicates: true },
+  );
+
+  if (error) {
+    throw new Error(`Failed to record unsubscribe: ${error.message}`);
   }
 }
 
